@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Install Desktop Pets as a real Windows app. 
+Install Desktop Pets as a real Windows app.
 
 Creates:
   * a Start Menu shortcut  (searchable as "Desktop Pets")
