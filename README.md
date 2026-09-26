@@ -34,11 +34,32 @@ WHAT IT DOES
 - Click a pet to boop it - it zooms off in a new direction, happily.
 - Close the control panel (or press "Close all") to say goodbye.
 
+DESIGN YOUR OWN PETS WITH DEEPSEEK
+The panel has a "Design a pet with AI" button. DeepSeek invents a pet -
+its shape, colours, size, speed, flapping, whether it leaves a trail or
+sparkles - and it appears on your desktop straight away. Your custom
+pets are remembered the next time you start the app.
+
+Pets come in six shapes: bird, fish, cat, blob, bug and ghost. Ask for
+"a sleepy purple owl" and you get a bird; ask for "a golden koi" and you
+get a fish. DeepSeek picks the closest shape to what you describe.
+
+One-time setup:
+1. Get a free API key at https://platform.deepseek.com/api_keys
+2. In the app, click "API key..." and paste it in.
+   (It is saved to %LOCALAPPDATA%\Desktop Pets\api_key.txt)
+
+You can also set the DEEPSEEK_API_KEY environment variable instead.
+Then click "Design a pet with AI" and describe what you want, for
+example "a sleepy purple owl that leaves a trail". Leave the box blank
+and DeepSeek will surprise you.
+
 The pets stay on top of your other windows, but only the pet itself
 takes up space - the rest of your screen works normally.
 
 FILES
 - desktop_pets.py  the app itself
+- pet_ai.py        the DeepSeek pet designer
 - launch_pets.pyw  silent launcher used by the shortcuts
 - install_app.py   adds Start Menu / desktop shortcuts
 - uninstall_app.py removes those shortcuts
