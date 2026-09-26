@@ -12,17 +12,52 @@ windows. Click a pet to boop it and watch it dart off happily.
 import math
 import random
 import sys
+import ctypes
+import json
+import logging
+import os
+from pathlib import Path
 import tkinter as tk
-from tkinter import messagebox
+from tkinter import messagebox, ttk
 
 # This color becomes see-through on Windows. Nothing drawn may use it.
-TRANSPARENT = "black"
+TRANSPARENT = "#ff00ff"
 
 PET_SIZE = 130          # pixel size of each pet's window
 TICK_MS = 40            # movement timer interval
 FLAP_EVERY = 4          # ticks between wing flaps
 MAX_PETS = 12
 START_PETS = 3
+
+
+def settings_path():
+    return Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "Desktop Pets" / "settings.json"
+
+
+def load_settings(path):
+    defaults = {"count": START_PETS, "speed": 1.0, "topmost": True}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            return defaults
+        if type(data.get("count")) is int:
+            defaults["count"] = max(0, min(MAX_PETS, data["count"]))
+        if type(data.get("speed")) in (int, float) and math.isfinite(data["speed"]):
+            defaults["speed"] = max(0.25, min(2.0, data["speed"]))
+        if type(data.get("topmost")) is bool:
+            defaults["topmost"] = data["topmost"]
+    except (OSError, ValueError):
+        pass
+    return defaults
+
+
+def work_area(root):
+    """Primary monitor's usable area, excluding the Windows taskbar."""
+    from ctypes import wintypes
+    rect = wintypes.RECT()
+    if sys.platform == "win32" and ctypes.windll.user32.SystemParametersInfoW(48, 0, ctypes.byref(rect), 0):
+        return rect.left, rect.top, rect.right, rect.bottom
+    return 0, 0, root.winfo_screenwidth(), root.winfo_screenheight()
 
 # (body color, belly color) pairs
 PALETTES = [
@@ -39,14 +74,15 @@ PALETTES = [
 class Pet:
     """One flying pet living in its own borderless window."""
 
-    def __init__(self, master, screen_w, screen_h):
-        self.screen_w = screen_w
-        self.screen_h = screen_h
+    def __init__(self, master, bounds, topmost=True):
+        self.bounds = bounds
         self.body, self.belly = random.choice(PALETTES)
 
         self.win = tk.Toplevel(master)
+        self.win.withdraw()
+        self.win.title("Desktop Pets - bird")
         self.win.overrideredirect(True)
-        self.win.attributes("-topmost", True)
+        self.win.attributes("-topmost", topmost)
         self.win.attributes("-transparentcolor", TRANSPARENT)
 
         self.canvas = tk.Canvas(
@@ -58,11 +94,16 @@ class Pet:
             bd=0,
         )
         self.canvas.pack()
-        self.canvas.bind("<Button-1>", lambda _event: self.boop())
+        self.canvas.bind("<ButtonPress-1>", self._press)
+        self.canvas.bind("<B1-Motion>", self._drag)
+        self.canvas.bind("<ButtonRelease-1>", self._release)
+        self.drag_origin = None
+        self.dragged = False
 
         # flight state
-        self.x = random.uniform(0, screen_w - PET_SIZE)
-        self.y = random.uniform(0, screen_h - PET_SIZE)
+        left, top, right, bottom = bounds
+        self.x = random.uniform(left, max(left, right - PET_SIZE))
+        self.y = random.uniform(top, max(top, bottom - PET_SIZE))
         self.angle = random.uniform(0, 2 * math.pi)
         self.speed = random.uniform(2.0, 3.5)
         self.tick = random.randrange(0, 1000)
@@ -71,6 +112,33 @@ class Pet:
 
         self._place()
         self.draw()
+        self.win.deiconify()
+
+    def _press(self, event):
+        self.drag_origin = (event.x_root, event.y_root, self.x, self.y)
+        self.dragged = False
+
+    def _drag(self, event):
+        if self.drag_origin is None:
+            return
+        px, py, x, y = self.drag_origin
+        dx, dy = event.x_root - px, event.y_root - py
+        if abs(dx) + abs(dy) > 4:
+            self.dragged = True
+        if self.dragged:
+            self.x, self.y = x + dx, y + dy
+            self._clamp()
+            self._place()
+
+    def _release(self, event):
+        if self.drag_origin is not None and not self.dragged:
+            self.boop()
+        self.drag_origin = None
+
+    def _clamp(self):
+        left, top, right, bottom = self.bounds
+        self.x = max(left, min(self.x, max(left, right - PET_SIZE)))
+        self.y = max(top, min(self.y, max(top, bottom - PET_SIZE)))
 
     # -- drawing ------------------------------------------------------
     def draw(self):
@@ -111,12 +179,20 @@ class Pet:
         # rosy cheek
         c.create_oval(cx + 8, cy - 2, cx + 14, cy + 4,
                       fill="#ff8fa3", outline="")
+        if math.cos(self.angle) < 0:
+            for item in c.find_all():
+                coords = c.coords(item)
+                for i in range(0, len(coords), 2):
+                    coords[i] = PET_SIZE - coords[i]
+                c.coords(item, *coords)
 
     # -- movement -----------------------------------------------------
     def _place(self):
         self.win.geometry(f"{PET_SIZE}x{PET_SIZE}+{int(self.x)}+{int(self.y)}")
 
-    def update(self):
+    def update(self, multiplier=1.0):
+        if self.drag_origin is not None:
+            return
         self.tick += 1
         if self.tick % FLAP_EVERY == 0:
             self.wing_up = not self.wing_up
@@ -124,7 +200,7 @@ class Pet:
         # wander a little
         self.angle += random.uniform(-0.25, 0.25)
 
-        speed = self.speed * (2.6 if self.boost > 0 else 1.0)
+        speed = self.speed * multiplier * (2.6 if self.boost > 0 else 1.0)
         if self.boost > 0:
             self.boost -= 1
 
@@ -132,18 +208,19 @@ class Pet:
         self.y += math.sin(self.angle) * speed + math.sin(self.tick * 0.08) * 0.8
 
         # bounce off the screen edges
-        margin = 10
-        if self.x < margin:
-            self.x = margin
+        left, top, right, bottom = self.bounds
+        max_x, max_y = max(left, right - PET_SIZE), max(top, bottom - PET_SIZE)
+        if self.x < left:
+            self.x = left
             self.angle = math.pi - self.angle
-        elif self.x > self.screen_w - PET_SIZE - margin:
-            self.x = self.screen_w - PET_SIZE - margin
+        elif self.x > max_x:
+            self.x = max_x
             self.angle = math.pi - self.angle
-        if self.y < margin:
-            self.y = margin
+        if self.y < top:
+            self.y = top
             self.angle = -self.angle
-        elif self.y > self.screen_h - PET_SIZE - margin:
-            self.y = self.screen_h - PET_SIZE - margin
+        elif self.y > max_y:
+            self.y = max_y
             self.angle = -self.angle
 
         self._place()
@@ -159,38 +236,63 @@ class Pet:
 
 
 class App:
-    def __init__(self):
+    def __init__(self, config_path=None):
+        self.config_path = config_path or settings_path()
+        self.settings = load_settings(self.config_path)
         self.root = tk.Tk()
-        self.root.withdraw()
-
-        self.screen_w = self.root.winfo_screenwidth()
-        self.screen_h = self.root.winfo_screenheight()
-
+        self.root.report_callback_exception = self._callback_error
+        self.bounds = work_area(self.root)
         self.pets = []
+        self.paused = False
+        self.hidden = False
+        self.closed = False
+        self.timer = None
+        self.frame = 0
+        self.speed = tk.DoubleVar(value=self.settings["speed"])
+        self.topmost = tk.BooleanVar(value=self.settings["topmost"])
 
-        # control panel
-        self.panel = tk.Toplevel(self.root)
+        # The main window stays in the taskbar, including when minimized.
+        self.panel = self.root
         self.panel.title("Desktop Pets")
         self.panel.resizable(False, False)
         self.panel.protocol("WM_DELETE_WINDOW", self.quit_all)
-
-        tk.Label(self.panel, text="Your tiny flying pets",
-                 font=("Segoe UI", 12, "bold")).pack(padx=16, pady=(12, 2))
-        self.count_label = tk.Label(self.panel, text="", font=("Segoe UI", 10))
-        self.count_label.pack(padx=16, pady=2)
-        tk.Label(self.panel, text="Tip: click a pet to boop it!",
-                 font=("Segoe UI", 9), fg="gray").pack(padx=16, pady=(0, 8))
-
-        buttons = tk.Frame(self.panel)
-        buttons.pack(padx=12, pady=(0, 12))
-        tk.Button(buttons, text="Add pet", width=10,
-                  command=self.add_pet).pack(side="left", padx=4)
-        tk.Button(buttons, text="Remove pet", width=10,
-                  command=self.remove_pet).pack(side="left", padx=4)
-        tk.Button(buttons, text="Close all", width=10,
-                  command=self.quit_all).pack(side="left", padx=4)
-
-        for _ in range(START_PETS):
+        style = ttk.Style(self.root)
+        style.theme_use("vista" if "vista" in style.theme_names() else "clam")
+        style.configure("TButton", padding=(10, 6), font=("Segoe UI", 10))
+        style.configure("TLabel", font=("Segoe UI", 10))
+        content = ttk.Frame(self.panel, padding=22)
+        content.pack(fill="both", expand=True)
+        ttk.Label(content, text="A little company for your desktop",
+                  font=("Segoe UI", 15, "bold")).pack(anchor="w")
+        self.count_label = ttk.Label(content)
+        self.count_label.pack(anchor="w", pady=(8, 18))
+        buttons = ttk.Frame(content)
+        buttons.pack(fill="x")
+        self.add_button = ttk.Button(buttons, text="Add pet", command=self.add_pet)
+        self.add_button.pack(side="left", expand=True, fill="x", padx=(0, 6))
+        self.remove_button = ttk.Button(buttons, text="Remove pet", command=self.remove_pet)
+        self.remove_button.pack(side="left", expand=True, fill="x", padx=(6, 0))
+        actions = ttk.Frame(content)
+        actions.pack(fill="x", pady=(10, 18))
+        self.pause_button = ttk.Button(actions, text="Pause", command=self.toggle_pause)
+        self.pause_button.pack(side="left", expand=True, fill="x", padx=(0, 6))
+        self.hide_button = ttk.Button(actions, text="Hide pets", command=self.toggle_hidden)
+        self.hide_button.pack(side="left", expand=True, fill="x", padx=(6, 0))
+        self.speed_label = ttk.Label(content)
+        self.speed_label.pack(anchor="w")
+        ttk.Scale(content, from_=0.25, to=2.0, variable=self.speed,
+                  command=self._speed_changed).pack(fill="x", pady=(6, 10))
+        ttk.Checkbutton(content, text="Keep pets above other windows", variable=self.topmost,
+                        command=self._topmost_changed).pack(anchor="w")
+        ttk.Separator(content).pack(fill="x", pady=18)
+        ttk.Label(content, text="Click a bird to boop it. Drag to move it.\n"
+                  "Minimize this panel to keep your pets flying.\n"
+                  "Closing the panel quits the app.", foreground="#555555").pack(anchor="w")
+        self.save_status = ttk.Label(content, foreground="#9c321a", wraplength=390)
+        self.save_status.pack(anchor="w", pady=(6, 0))
+        ttk.Button(content, text="Quit Desktop Pets", command=self.quit_all).pack(anchor="e", pady=(8, 0))
+        self._speed_changed()
+        for _ in range(self.settings["count"]):
             self.add_pet()
         self._refresh_label()
         self._loop()
@@ -198,7 +300,10 @@ class App:
     def add_pet(self):
         if len(self.pets) >= MAX_PETS:
             return
-        self.pets.append(Pet(self.root, self.screen_w, self.screen_h))
+        pet = Pet(self.root, self.bounds, self.topmost.get())
+        if self.hidden:
+            pet.win.withdraw()
+        self.pets.append(pet)
         self._refresh_label()
 
     def remove_pet(self):
@@ -209,14 +314,71 @@ class App:
     def _refresh_label(self):
         n = len(self.pets)
         self.count_label.config(
-            text=f"{n} pet{'s' if n != 1 else ''} on your desktop")
+            text=f"{n} pet{'s' if n != 1 else ''} on your desktop" +
+                 (" · hidden" if self.hidden else " · paused" if self.paused else ""))
+        self.add_button.config(state="disabled" if n >= MAX_PETS else "normal")
+        self.remove_button.config(state="disabled" if not n else "normal")
+
+    def toggle_pause(self):
+        self.paused = not self.paused
+        self.pause_button.config(text="Resume" if self.paused else "Pause")
+        self._refresh_label()
+
+    def toggle_hidden(self):
+        self.hidden = not self.hidden
+        for pet in self.pets:
+            pet.win.withdraw() if self.hidden else pet.win.deiconify()
+        self.hide_button.config(text="Show pets" if self.hidden else "Hide pets")
+        self._refresh_label()
+
+    def _speed_changed(self, _value=None):
+        self.speed_label.config(text=f"Flight speed: {self.speed.get():.2f}×")
+
+    def _topmost_changed(self):
+        for pet in self.pets:
+            pet.win.attributes("-topmost", self.topmost.get())
+
+    def save_settings(self):
+        data = {"count": len(self.pets), "speed": self.speed.get(), "topmost": self.topmost.get()}
+        temporary = self.config_path.with_suffix(f".{os.getpid()}.tmp")
+        try:
+            self.config_path.parent.mkdir(parents=True, exist_ok=True)
+            temporary.write_text(json.dumps(data, indent=2), encoding="utf-8")
+            temporary.replace(self.config_path)
+        except OSError:
+            logging.exception("Could not save settings")
+            self.save_status.config(text="Settings could not be saved. Changes apply for this session.")
+        else:
+            self.save_status.config(text="")
+
+    def _callback_error(self, exc_type, exc, tb):
+        logging.error("App error", exc_info=(exc_type, exc, tb))
+        messagebox.showerror("Desktop Pets", f"Something went wrong: {exc}\n\nPlease restart Desktop Pets.", parent=self.root)
 
     def _loop(self):
-        for pet in self.pets:
-            pet.update()
-        self.root.after(TICK_MS, self._loop)
+        if self.closed:
+            return
+        self.frame += 1
+        if self.frame % 50 == 0:
+            self.bounds = work_area(self.root)
+            for pet in self.pets:
+                pet.bounds = self.bounds
+                pet._clamp()
+                pet._place()
+        if not self.paused and not self.hidden:
+            for pet in self.pets:
+                pet.update(self.speed.get())
+        if self.frame % 125 == 0:
+            self.save_settings()
+        self.timer = self.root.after(TICK_MS, self._loop)
 
     def quit_all(self):
+        if self.closed:
+            return
+        self.save_settings()
+        self.closed = True
+        if self.timer is not None:
+            self.root.after_cancel(self.timer)
         for pet in self.pets:
             pet.destroy()
         self.pets = []
@@ -226,13 +388,31 @@ class App:
         self.root.mainloop()
 
 
-if __name__ == "__main__":
+def main():
     if sys.platform != "win32":
-        messagebox.showerror(
-            "Desktop Pets",
-            "Desktop Pets needs Windows to run.\n\n"
-            "Please copy these files to a Windows 10/11 PC with "
-            "Python 3 installed and run run_pets.bat there.",
-        )
-        sys.exit(1)
-    App().run()
+        print("Desktop Pets requires Windows 10 or 11.", file=sys.stderr)
+        return 1
+    try:
+        ctypes.windll.shcore.SetProcessDpiAwareness(1)
+    except (AttributeError, OSError):
+        pass
+    try:
+        folder = settings_path().parent
+        folder.mkdir(parents=True, exist_ok=True)
+        logging.basicConfig(filename=folder / "app.log", level=logging.WARNING,
+                            format="%(asctime)s %(levelname)s %(message)s")
+    except OSError:
+        logging.basicConfig(handlers=[logging.NullHandler()])
+    try:
+        App().run()
+    except Exception:
+        logging.exception("Startup failed")
+        ctypes.windll.user32.MessageBoxW(None,
+            "Desktop Pets could not start.\nSee %LOCALAPPDATA%\\Desktop Pets\\app.log for details.",
+            "Desktop Pets", 16)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
