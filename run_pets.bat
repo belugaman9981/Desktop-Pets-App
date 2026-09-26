@@ -1,7 +1,7 @@
 @echo off
 rem Double-click to launch Desktop Pets (needs Python 3 for Windows)
 title Desktop Pets
-py -3 "%~dp0desktop_pets.py"
+start "" pythonw "%~dp0launch_pets.pyw"
 if errorlevel 1 (
     echo.
     echo Desktop Pets needs Python 3 for Windows.
