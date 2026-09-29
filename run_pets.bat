@@ -15,3 +15,4 @@ echo Desktop Pets needs Python 3.10 or newer for Windows.
 echo Get it at https://www.python.org/downloads/
 echo Include the Python launcher during installation, then try again.
 pause
+
