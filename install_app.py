@@ -90,7 +90,7 @@ def main():
 
     menu = start_menu_dir()
     links = [
-        (menu / f"{APP_NAME}.lnk", str(LAUNCHER), "", icon),
+        (menu / f"{APP_NAME}.lnk", target, f'"{LAUNCHER}"', icon),
         (menu / f"Uninstall {APP_NAME}.lnk", str(pythonw()), f'"{HERE / "uninstall_app.py"}"', icon),
     ]
 
@@ -98,7 +98,7 @@ def main():
     if answer in ("", "y", "yes"):
         desk = desktop_dir()
         if desk:
-            links.append((desk / f"{APP_NAME}.lnk", str(LAUNCHER), "", icon))
+            links.append((desk / f"{APP_NAME}.lnk", target, f'"{LAUNCHER}"', icon))
 
     for link, tgt, args, ico in links:
         try:

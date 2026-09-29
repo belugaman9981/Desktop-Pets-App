@@ -1,6 +1,12 @@
 # Build and Release Folders
 bin-debug/
 bin-release/
+__pycache__/
+*.py[cod]
+.build-venv/
+build/
+dist/
+.qa/
 [Oo]bj/
 [Bb]in/
 

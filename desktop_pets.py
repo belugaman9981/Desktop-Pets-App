@@ -16,10 +16,16 @@ import ctypes
 import json
 import logging
 import os
+import queue
 import threading
+import webbrowser
 from pathlib import Path
 import tkinter as tk
-from tkinter import messagebox, simpledialog, ttk
+from tkinter import messagebox, ttk
+from tkinter.scrolledtext import ScrolledText
+
+from acumen_client import AcumenClient, normalize_base_url
+from acumen_bridge import LocalBridge
 
 try:
     import pet_ai
@@ -42,7 +48,9 @@ def settings_path():
 
 
 def load_settings(path):
-    defaults = {"count": START_PETS, "speed": 1.0, "topmost": True, "pets": []}
+    defaults = {"count": START_PETS, "speed": 1.0, "topmost": True, "pets": [],
+                "spontaneous": True, "sound": False, "draft": "", "idea": "",
+                "acumen_url": "http://127.0.0.1:8765"}
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
         if not isinstance(data, dict):
@@ -55,7 +63,18 @@ def load_settings(path):
             defaults["topmost"] = data["topmost"]
         if isinstance(data.get("pets"), list):
             defaults["pets"] = [p for p in data["pets"] if isinstance(p, dict)][:MAX_PETS]
-    except (OSError, ValueError):
+        for field in ("spontaneous", "sound"):
+            if type(data.get(field)) is bool:
+                defaults[field] = data[field]
+        for field in ("draft", "idea"):
+            if isinstance(data.get(field), str):
+                defaults[field] = data[field][:12000]
+        if isinstance(data.get("acumen_url"), str):
+            try:
+                defaults["acumen_url"] = normalize_base_url(data["acumen_url"])
+            except RuntimeError:
+                pass
+    except (OSError, ValueError, OverflowError):
         pass
     return defaults
 
@@ -85,7 +104,14 @@ class Pet:
 
     def __init__(self, master, bounds, topmost=True, design=None):
         self.bounds = bounds
-        design = design or {}
+        if pet_ai is not None:
+            if design is None and hasattr(pet_ai, "random_pet"):
+                design = pet_ai.random_pet()
+            clean = getattr(pet_ai, "clean_design", None) or pet_ai._clean
+            design = clean(design)
+        else:
+            # Keep the basic pets usable if the optional designer is missing.
+            design = {}
         self.design = design
         self.name = str(design.get("name") or "bird")[:20]
 
@@ -114,8 +140,16 @@ class Pet:
             self.trail = self.sparkle = False
             self.sound, self.personality = "chirp", ""
 
+        self.accessory = design.get("accessory", "none")
+        self.temperament = design.get("temperament", "playful")
+        self.sound_enabled = False
+        self.action = "wander"
+        self.action_ticks = 0
+        self.caption = ""
+        self.caption_ticks = 0
+        self.idle_ticks = random.randint(350, 750)
         self.size = max(60, int(PET_SIZE * self.scale))
-        self.ghosts = []  # recent positions, for the trail effect
+        self.ghosts = []  # recent screen positions, for the trail effect
 
         self.win = tk.Toplevel(master)
         self.win.withdraw()
@@ -136,6 +170,15 @@ class Pet:
         self.canvas.bind("<ButtonPress-1>", self._press)
         self.canvas.bind("<B1-Motion>", self._drag)
         self.canvas.bind("<ButtonRelease-1>", self._release)
+        self.canvas.bind("<Button-3>", self._show_menu)
+        self.menu = tk.Menu(self.win, tearoff=False)
+        self.menu.add_command(label=self.name, state="disabled")
+        self.menu.add_separator()
+        for label, action in (("Give a treat", "treat"), ("Dance", "dance"),
+                              ("Take a nap", "nap"), ("Zoom around", "zoom"),
+                              ("Follow my cursor for 15s", "follow"),
+                              ("Wander", "wander")):
+            self.menu.add_command(label=label, command=lambda a=action: self.set_action(a))
         self.drag_origin = None
         self.dragged = False
 
@@ -153,6 +196,33 @@ class Pet:
         self.draw()
         self.win.deiconify()
 
+    def _show_menu(self, event):
+        try:
+            self.menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            self.menu.grab_release()
+
+    def set_action(self, action):
+        """Start a short activity. Cursor following only starts on request."""
+        durations = {"wander": 0, "dance": 5, "nap": 12, "zoom": 4,
+                     "follow": 15, "treat": 3}
+        if action not in durations:
+            return False
+        self.action = action
+        self.action_ticks = int(durations[action] * 1000 / TICK_MS)
+        self.boost = 0
+        self.idle_ticks = random.randint(350, 750)
+        self.caption = {"wander": "Off we go", "dance": "Let's dance!",
+                        "nap": "Zzz...", "zoom": "Wheee!",
+                        "follow": "Following you", "treat": "Yum! Thank you"}[action]
+        self.caption_ticks = self.action_ticks or 50
+        if action == "zoom":
+            self.angle = random.uniform(0, 2 * math.pi)
+        if action in ("nap", "dance", "treat"):
+            self.ghosts.clear()
+        self.draw()
+        return True
+
     def _press(self, event):
         self.drag_origin = (event.x_root, event.y_root, self.x, self.y)
         self.dragged = False
@@ -166,8 +236,10 @@ class Pet:
             self.dragged = True
         if self.dragged:
             self.x, self.y = x + dx, y + dy
+            self.ghosts.clear()
             self._clamp()
             self._place()
+            self.draw()
 
     def _release(self, event):
         if self.drag_origin is not None and not self.dragged:
@@ -186,15 +258,22 @@ class Pet:
         s = self.size
         cx, cy = s // 2, s // 2
         k = s / PET_SIZE  # scale factor for the original artwork
+        if self.action == "dance":
+            cx += math.sin(self.tick * 0.45) * 7 * k
+            cy -= abs(math.sin(self.tick * 0.3)) * 7 * k
+        elif self.action == "nap":
+            cy += math.sin(self.tick * 0.06) * 2 * k
 
         # fading trail behind the pet
         if self.trail and self.ghosts:
             for index, (gx, gy) in enumerate(self.ghosts):
                 fade = (index + 1) / (len(self.ghosts) + 1)
                 radius = 10 * k * (0.4 + fade)
+                gx, gy = gx - self.x + s / 2, gy - self.y + s / 2
                 c.create_oval(gx - radius, gy - radius, gx + radius, gy + radius,
-                              fill=self.belly, outline="", stipple="gray50")
+                              fill=self.belly, outline="", stipple="gray50", tags="trail")
 
+        background_items = set(c.find_all())
         drawer = {
             "bird": self._draw_bird,
             "fish": self._draw_fish,
@@ -204,6 +283,15 @@ class Pet:
             "ghost": self._draw_ghost,
         }.get(self.shape, self._draw_bird)
         drawer(c, cx, cy, k)
+        self._draw_accessory(c, cx, cy, k)
+
+        # Mirror only the animal: captions and the world-space trail stay put.
+        if math.cos(self.angle) < 0:
+            for item in set(c.find_all()) - background_items:
+                coords = c.coords(item)
+                for i in range(0, len(coords), 2):
+                    coords[i] = s - coords[i]
+                c.coords(item, *coords)
 
         # sparkles twinkling around the pet
         if self.sparkle:
@@ -215,15 +303,80 @@ class Pet:
                 c.create_oval(sx - r, sy - r, sx + r, sy + r,
                               fill="#fff6c2", outline="")
 
-        if math.cos(self.angle) < 0:
-            for item in c.find_all():
-                coords = c.coords(item)
-                for i in range(0, len(coords), 2):
-                    coords[i] = s - coords[i]
-                c.coords(item, *coords)
+        if self.action == "treat":
+            for index in range(3):
+                hx = s / 2 + (index - 1) * 23 * k
+                hy = (30 - (self.tick * 0.8 + index * 9) % 24) * k
+                r = 5 * k
+                c.create_polygon(hx, hy + r, hx - r, hy, hx - r, hy - r,
+                                 hx, hy - r / 2, hx + r, hy - r,
+                                 hx + r, hy, fill=self.cheek, outline="",
+                                 smooth=True, tags="reaction")
+
+        if self.caption and self.caption_ticks > 0:
+            text = c.create_text(s / 2, s - 11 * k, text=self.caption,
+                                 font=("Segoe UI", max(7, int(8 * k))),
+                                 fill="#f9fafb", width=s - 10 * k, tags="caption")
+            box = c.bbox(text)
+            if box:
+                plate = c.create_rectangle(box[0] - 4 * k, box[1] - 2 * k,
+                                           box[2] + 4 * k, box[3] + 2 * k,
+                                           fill="#27313f", outline="", tags="caption")
+                c.tag_lower(plate, text)
+
+    def _draw_accessory(self, c, cx, cy, k):
+        top = cy - (39 if self.shape in ("cat", "bug") else 30) * k
+        if self.accessory == "bow":
+            y = cy + 21 * k
+            c.create_polygon(cx, y, cx - 13 * k, y - 7 * k,
+                             cx - 13 * k, y + 7 * k, fill=self.cheek,
+                             outline=self.eye, tags="accessory")
+            c.create_polygon(cx, y, cx + 13 * k, y - 7 * k,
+                             cx + 13 * k, y + 7 * k, fill=self.cheek,
+                             outline=self.eye, tags="accessory")
+            c.create_oval(cx - 3 * k, y - 3 * k, cx + 3 * k, y + 3 * k,
+                          fill=self.beak, outline="", tags="accessory")
+        elif self.accessory == "hat":
+            c.create_rectangle(cx - 11 * k, top - 13 * k,
+                               cx + 11 * k, top + 2 * k,
+                               fill=self.eye, outline="", tags="accessory")
+            c.create_rectangle(cx - 11 * k, top - 3 * k,
+                               cx + 11 * k, top + 1 * k,
+                               fill=self.cheek, outline="", tags="accessory")
+            c.create_line(cx - 19 * k, top + 2 * k, cx + 19 * k, top + 2 * k,
+                          fill=self.eye, width=max(2, int(4 * k)), tags="accessory")
+        elif self.accessory == "crown":
+            c.create_polygon(cx - 17 * k, top - 11 * k, cx - 10 * k, top - 4 * k,
+                             cx, top - 17 * k, cx + 10 * k, top - 4 * k,
+                             cx + 17 * k, top - 11 * k, cx + 14 * k, top + 4 * k,
+                             cx - 14 * k, top + 4 * k,
+                             fill="#f3c851", outline="#b98523", tags="accessory")
+        elif self.accessory == "glasses":
+            eyes = {"bird": [(17, -8)], "fish": [(16, -6)],
+                    "cat": [(-12, -8), (12, -8)],
+                    "blob": [(-11, -8), (11, -8)],
+                    "bug": [(-9, -6), (9, -6)],
+                    "ghost": [(-10, -10), (10, -10)]}.get(self.shape, [(17, -8)])
+            radius = 9 if self.shape == "blob" else 7
+            for ex, ey in eyes:
+                c.create_oval(cx + (ex - radius) * k, cy + (ey - radius) * k,
+                              cx + (ex + radius) * k, cy + (ey + radius) * k,
+                              outline=self.eye, width=max(1, int(2 * k)), tags="accessory")
+            if len(eyes) == 2:
+                c.create_line(cx + (eyes[0][0] + radius) * k, cy + eyes[0][1] * k,
+                              cx + (eyes[1][0] - radius) * k, cy + eyes[1][1] * k,
+                              fill=self.eye, width=max(1, int(2 * k)), tags="accessory")
+            else:
+                c.create_line(cx - 8 * k, cy - 12 * k, cx + 10 * k, cy - 8 * k,
+                              fill=self.eye, width=max(1, int(2 * k)), tags="accessory")
 
     def _eye(self, c, x, y, r, k):
         """A round eye with a highlight, centred on (x, y)."""
+        if self.action == "nap" or self.tick % 115 < 4:
+            c.create_line(x - r, y, x, y + 2 * k, x + r, y,
+                          smooth=True, fill=self.eye, width=max(1, int(2 * k)),
+                          tags="eyes-closed")
+            return
         c.create_oval(x - r, y - r, x + r, y + r, fill="white", outline="")
         pr = r * 0.55
         c.create_oval(x - pr + r * 0.25, y - pr + r * 0.15,
@@ -420,24 +573,56 @@ class Pet:
 
     # -- movement -----------------------------------------------------
     def _place(self):
-        self.win.geometry(f"{self.size}x{self.size}+{int(self.x)}+{int(self.y)}")
+        self.win.geometry(f"{self.size}x{self.size}{int(self.x):+d}{int(self.y):+d}")
 
-    def update(self, multiplier=1.0):
+    def update(self, multiplier=1.0, cursor=None, spontaneous=True):
         if self.drag_origin is not None:
             return
         self.tick += 1
-        if self.tick % self.flap_every == 0:
+        if self.caption_ticks > 0:
+            self.caption_ticks -= 1
+        if self.action_ticks > 0:
+            self.action_ticks -= 1
+            if self.action_ticks == 0:
+                self.action = "wander"
+                self.caption = ""
+                self.ghosts.clear()
+        self.idle_ticks = max(0, self.idle_ticks - 1)
+        if spontaneous and self.action == "wander" and self.idle_ticks == 0:
+            choices = {"calm": ("nap", "nap", "dance"),
+                       "curious": ("dance", "zoom", "nap"),
+                       "playful": ("dance", "zoom", "zoom")}
+            self.set_action(random.choice(choices.get(self.temperament, choices["playful"])))
+        if self.action != "nap" and self.tick % self.flap_every == 0:
             self.wing_up = not self.wing_up
 
-        # wander a little
-        self.angle += random.uniform(-self.wander, self.wander)
-
-        speed = self.speed * multiplier * (2.6 if self.boost > 0 else 1.0)
+        moving = self.action not in ("nap", "dance", "treat")
+        speed = self.speed * multiplier * (2.6 if self.boost > 0 or self.action == "zoom" else 1.0)
         if self.boost > 0:
             self.boost -= 1
 
-        self.x += math.cos(self.angle) * speed
-        self.y += math.sin(self.angle) * speed + math.sin(self.tick * 0.08) * self.bob
+        if self.action == "follow" and cursor is not None:
+            dx = cursor[0] - (self.x + self.size / 2)
+            dy = cursor[1] - (self.y + self.size / 2)
+            distance = math.hypot(dx, dy)
+            if distance > 45:
+                self.angle = math.atan2(dy, dx)
+                speed = min(speed * 1.5, distance - 45)
+            else:
+                moving = False
+        else:
+            self.angle += random.uniform(-self.wander, self.wander)
+
+        if moving:
+            if self.trail and self.tick % 2 == 0:
+                self.ghosts.append((self.x, self.y))
+                del self.ghosts[:-TRAIL_LENGTH]
+            self.x += math.cos(self.angle) * speed
+            self.y += math.sin(self.angle) * speed
+            if self.action != "follow":
+                self.y += math.sin(self.tick * 0.08) * self.bob
+        elif self.ghosts:
+            self.ghosts.pop(0)
 
         # bounce off the screen edges
         left, top, right, bottom = self.bounds
@@ -455,24 +640,29 @@ class Pet:
             self.y = max_y
             self.angle = -self.angle
 
-        if self.trail:
-            self.ghosts.append((self.size // 2, self.size // 2))
-            del self.ghosts[:-TRAIL_LENGTH]
-
         self._place()
         self.draw()
 
     def boop(self):
         """A click gives the pet a happy burst of speed in a new direction."""
+        self.action = "wander"
+        self.action_ticks = 0
+        self.caption, self.caption_ticks = "Boop!", 45
+        self.idle_ticks = random.randint(350, 750)
         self.boost = 25
         self.angle = random.uniform(0, 2 * math.pi)
-        if self.sound != "none":
-            try:
-                import winsound
-                tone = {"chirp": 1400, "hoot": 500, "beep": 900}.get(self.sound, 1200)
-                winsound.Beep(tone, 60)
-            except (ImportError, RuntimeError):
-                pass
+        self.draw()
+        if self.sound_enabled and self.sound != "none":
+            tone = {"chirp": 1400, "hoot": 500, "beep": 900}.get(self.sound, 1200)
+
+            def play():
+                try:
+                    import winsound
+                    winsound.Beep(tone, 60)
+                except (ImportError, RuntimeError):
+                    pass
+
+            threading.Thread(target=play, daemon=True).start()
 
     def destroy(self):
         self.win.destroy()
@@ -480,73 +670,61 @@ class Pet:
 
 class App:
     def __init__(self, config_path=None):
-        self.config_path = config_path or settings_path()
+        self.config_path = Path(config_path) if config_path else settings_path()
         self.settings = load_settings(self.config_path)
         self.root = tk.Tk()
         self.root.report_callback_exception = self._callback_error
         self.bounds = work_area(self.root)
         self.pets = []
-        self.paused = False
-        self.hidden = False
-        self.closed = False
+        self.paused = self.hidden = self.closed = False
         self.timer = None
         self.frame = 0
+        self.results = queue.Queue()
+        self.busy = False
+        self.request_id = 0
+        self.client = None
+        self.bridge = LocalBridge()
+        self.last_question = ""
         self.speed = tk.DoubleVar(value=self.settings["speed"])
         self.topmost = tk.BooleanVar(value=self.settings["topmost"])
-
-        # The main window stays in the taskbar, including when minimized.
+        self.spontaneous = tk.BooleanVar(value=self.settings["spontaneous"])
+        self.sound = tk.BooleanVar(value=self.settings["sound"])
+        self.idea = tk.StringVar(value=self.settings["idea"])
+        self.acumen_url = tk.StringVar(value=os.environ.get("ACUMEN_BRIDGE_URL") or self.settings["acumen_url"])
+        self.token = tk.StringVar(value=os.environ.get("ACUMEN_TOKEN", ""))
         self.panel = self.root
         self.panel.title("Desktop Pets")
-        self.panel.resizable(False, False)
+        self.panel.geometry("620x740")
+        self.panel.minsize(590, 710)
         self.panel.protocol("WM_DELETE_WINDOW", self.quit_all)
+        icon = Path(__file__).with_name("pets.ico")
+        if icon.exists():
+            self.panel.iconbitmap(str(icon))
         style = ttk.Style(self.root)
         style.theme_use("vista" if "vista" in style.theme_names() else "clam")
-        style.configure("TButton", padding=(10, 6), font=("Segoe UI", 10))
+        style.configure("TButton", padding=(8, 5), font=("Segoe UI", 10))
         style.configure("TLabel", font=("Segoe UI", 10))
-        content = ttk.Frame(self.panel, padding=22)
+        content = ttk.Frame(self.panel, padding=16)
         content.pack(fill="both", expand=True)
         ttk.Label(content, text="A little company for your desktop",
-                  font=("Segoe UI", 15, "bold")).pack(anchor="w")
+                  font=("Segoe UI", 16, "bold")).pack(anchor="w")
         self.count_label = ttk.Label(content)
-        self.count_label.pack(anchor="w", pady=(8, 18))
-        buttons = ttk.Frame(content)
-        buttons.pack(fill="x")
-        self.add_button = ttk.Button(buttons, text="Add pet", command=self.add_pet)
-        self.add_button.pack(side="left", expand=True, fill="x", padx=(0, 6))
-        self.remove_button = ttk.Button(buttons, text="Remove pet", command=self.remove_pet)
-        self.remove_button.pack(side="left", expand=True, fill="x", padx=(6, 0))
-        actions = ttk.Frame(content)
-        actions.pack(fill="x", pady=(10, 18))
-        self.pause_button = ttk.Button(actions, text="Pause", command=self.toggle_pause)
-        self.pause_button.pack(side="left", expand=True, fill="x", padx=(0, 6))
-        self.hide_button = ttk.Button(actions, text="Hide pets", command=self.toggle_hidden)
-        self.hide_button.pack(side="left", expand=True, fill="x", padx=(6, 0))
-        self.speed_label = ttk.Label(content)
-        self.speed_label.pack(anchor="w")
-        ttk.Scale(content, from_=0.25, to=2.0, variable=self.speed,
-                  command=self._speed_changed).pack(fill="x", pady=(6, 10))
-        ttk.Checkbutton(content, text="Keep pets above other windows", variable=self.topmost,
-                        command=self._topmost_changed).pack(anchor="w")
-        ttk.Separator(content).pack(fill="x", pady=18)
-        ttk.Label(content, text="Design a pet with DeepSeek",
-                  font=("Segoe UI", 11, "bold")).pack(anchor="w")
-        self.ai_status = ttk.Label(content, foreground="#555555", wraplength=390)
-        self.ai_status.pack(anchor="w", pady=(4, 8))
-        ai_row = ttk.Frame(content)
-        ai_row.pack(fill="x")
-        self.ai_button = ttk.Button(ai_row, text="Design a pet with AI", command=self.design_pet_with_ai)
-        self.ai_button.pack(side="left", expand=True, fill="x", padx=(0, 6))
-        self.key_button = ttk.Button(ai_row, text="API key…", command=self.set_api_key)
-        self.key_button.pack(side="left", padx=(6, 0))
-        ttk.Separator(content).pack(fill="x", pady=18)
-        ttk.Label(content, text="Click a bird to boop it. Drag to move it.\n"
-                  "Minimize this panel to keep your pets flying.\n"
-                  "Closing the panel quits the app.", foreground="#555555").pack(anchor="w")
-        self.save_status = ttk.Label(content, foreground="#9c321a", wraplength=390)
-        self.save_status.pack(anchor="w", pady=(6, 0))
-        ttk.Button(content, text="Quit Desktop Pets", command=self.quit_all).pack(anchor="e", pady=(8, 0))
+        self.count_label.pack(anchor="w", pady=(6, 12))
+        footer = ttk.Frame(content)
+        footer.pack(side="bottom", fill="x", pady=(6, 0))
+        ttk.Label(footer, text="Minimize to keep pets flying. Close to quit.",
+                  foreground="#555555").pack(side="left")
+        ttk.Button(footer, text="Quit", command=self.quit_all).pack(side="right")
+        self.save_status = ttk.Label(content, foreground="#9c321a", wraplength=550)
+        self.tabs = ttk.Notebook(content)
+        self.tabs.pack(fill="both", expand=True)
+        play = ttk.Frame(self.tabs, padding=14)
+        chat = ttk.Frame(self.tabs, padding=14)
+        self.tabs.add(play, text="Pets & play")
+        self.tabs.add(chat, text="Ask Acumen")
+        self._build_play(play)
+        self._build_chat(chat)
         self._speed_changed()
-        self._refresh_ai_status()
         for design in self.settings["pets"]:
             self.add_pet(design)
         while len(self.pets) < self.settings["count"]:
@@ -554,91 +732,251 @@ class App:
         self._refresh_label()
         self._loop()
 
-    # -- DeepSeek pet designer ----------------------------------------
-    def _refresh_ai_status(self):
-        if pet_ai is None:
-            self.ai_button.config(state="disabled")
-            self.key_button.config(state="disabled")
-            self.ai_status.config(text="pet_ai.py is missing, so AI pets are unavailable.")
-            return
-        if pet_ai.load_api_key():
-            self.ai_status.config(text="Ready. Describe a pet, or leave it blank for a surprise.")
-        else:
-            self.ai_status.config(
-                text="No API key yet. Click \"API key…\" and paste your DeepSeek key "
-                     "(get one at platform.deepseek.com).")
+    def _build_play(self, content):
+        row = ttk.Frame(content)
+        row.pack(fill="x")
+        self.add_button = ttk.Button(row, text="Surprise pet", command=self.add_pet)
+        self.add_button.pack(side="left", expand=True, fill="x", padx=(0, 6))
+        self.remove_button = ttk.Button(row, text="Remove last pet", command=self.remove_pet)
+        self.remove_button.pack(side="left", expand=True, fill="x")
+        ttk.Label(content, text="Make a pet", font=("Segoe UI", 11, "bold")).pack(anchor="w", pady=(10, 4))
+        ttk.Label(content, text="Try a sleepy purple cat with a crown. Made locally, instantly.",
+                  foreground="#555555").pack(anchor="w")
+        row = ttk.Frame(content)
+        row.pack(fill="x", pady=(6, 10))
+        self.idea_entry = ttk.Entry(row, textvariable=self.idea)
+        self.idea_entry.pack(side="left", fill="x", expand=True, padx=(0, 6))
+        self.idea_entry.bind("<Return>", lambda _event: self.design_pet())
+        self.design_button = ttk.Button(row, text="Create", command=self.design_pet)
+        self.design_button.pack(side="right")
+        ttk.Label(content, text="Play with everyone", font=("Segoe UI", 11, "bold")).pack(anchor="w", pady=(0, 4))
+        actions = ttk.Frame(content)
+        actions.pack(fill="x")
+        for index, (label, action) in enumerate((("Give treats", "treat"), ("Dance", "dance"),
+                ("Nap", "nap"), ("Zoomies", "zoom"), ("Follow cursor", "follow"), ("Wander", "wander"))):
+            ttk.Button(actions, text=label, command=lambda a=action: self.play(a)).grid(
+                row=index // 3, column=index % 3, sticky="ew", padx=2, pady=3)
+        for column in range(3):
+            actions.columnconfigure(column, weight=1)
+        self.play_status = ttk.Label(content, text="Right-click any pet to play with just that pet.",
+                                     foreground="#555555", wraplength=510)
+        self.play_status.pack(anchor="w", pady=(6, 6))
+        row = ttk.Frame(content)
+        row.pack(fill="x")
+        self.pause_button = ttk.Button(row, text="Pause", command=self.toggle_pause)
+        self.pause_button.pack(side="left", expand=True, fill="x", padx=(0, 6))
+        self.hide_button = ttk.Button(row, text="Hide pets", command=self.toggle_hidden)
+        self.hide_button.pack(side="left", expand=True, fill="x")
+        self.speed_label = ttk.Label(content)
+        self.speed_label.pack(anchor="w", pady=(8, 0))
+        ttk.Scale(content, from_=0.25, to=2.0, variable=self.speed,
+                  command=self._speed_changed).pack(fill="x", pady=(4, 8))
+        for label, variable in (("Little surprises while pets wander", self.spontaneous),
+                                ("Pet sounds", self.sound),
+                                ("Keep pets above other windows", self.topmost)):
+            ttk.Checkbutton(content, text=label, variable=variable,
+                            command=self._preferences_changed).pack(anchor="w", pady=2)
+        ttk.Label(content, text="Click to boop. Drag to move. Follow cursor lasts 15 seconds.",
+                  foreground="#555555", wraplength=510).pack(anchor="w", pady=(10, 0))
 
-    def set_api_key(self):
-        if pet_ai is None:
-            return
-        current = pet_ai.load_api_key()
-        key = simpledialog.askstring(
-            "DeepSeek API key",
-            "Paste your DeepSeek API key.\nIt is stored in %LOCALAPPDATA%\\Desktop Pets\\api_key.txt",
-            initialvalue=current, show="*", parent=self.root,
-        )
-        if key is None:
-            return
-        key = key.strip()
-        if not key:
-            return
-        try:
-            pet_ai.save_api_key(key)
-        except OSError as exc:
-            messagebox.showerror("Desktop Pets", f"Could not save the key:\n{exc}", parent=self.root)
-            return
-        self._refresh_ai_status()
+    def _build_chat(self, content):
+        ttk.Label(content, text="Your pets, with AcumenAI", font=("Segoe UI", 12, "bold")).pack(anchor="w")
+        ttk.Label(content, text="Questions go to your local Acumen bridge. Pet creation stays local.",
+                  foreground="#555555", wraplength=510).pack(anchor="w", pady=(4, 8))
+        fields = ttk.Frame(content)
+        fields.pack(fill="x")
+        fields.columnconfigure(1, weight=1)
+        ttk.Label(fields, text="Address").grid(row=0, column=0, sticky="w", padx=(0, 8), pady=3)
+        self.url_entry = ttk.Entry(fields, textvariable=self.acumen_url)
+        self.url_entry.grid(row=0, column=1, sticky="ew", pady=3)
+        ttk.Label(fields, text="Pairing token").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=3)
+        self.token_entry = ttk.Entry(fields, textvariable=self.token, show="*")
+        self.token_entry.grid(row=1, column=1, sticky="ew", pady=3)
+        self.token_entry.bind("<Return>", lambda _event: self.connect_acumen())
+        buttons = ttk.Frame(content)
+        buttons.pack(fill="x", pady=(6, 4))
+        self.connect_button = ttk.Button(buttons, text="Connect", command=self.connect_acumen)
+        self.connect_button.pack(side="left")
+        self.start_button = ttk.Button(buttons, text="Start Acumen", command=self.start_acumen)
+        self.start_button.pack(side="left", padx=6)
+        ttk.Button(buttons, text="Open Acumen", command=self.open_acumen).pack(side="left")
+        self.ai_status = ttk.Label(content, text="Start Acumen here, or paste a running bridge's token and connect.",
+                                   wraplength=510, foreground="#555555")
+        self.ai_status.pack(anchor="w", pady=(4, 6))
+        self.transcript = ScrolledText(content, height=9, wrap="word", font=("Segoe UI", 10),
+                                      relief="solid", borderwidth=1, padx=10, pady=8, state="disabled")
+        self.transcript.pack(fill="both", expand=True)
+        self.transcript.tag_configure("You", foreground="#555555")
+        self.transcript.tag_configure("Acumen", foreground="#176648")
+        self.transcript.tag_configure("Connection", foreground="#9c321a")
+        ttk.Label(content, text="Ask a question · Ctrl+Enter to send").pack(anchor="w", pady=(8, 4))
+        self.draft = tk.Text(content, height=3, wrap="word", font=("Segoe UI", 10), undo=True)
+        self.draft.pack(fill="x")
+        self.draft.insert("1.0", self.settings["draft"])
+        self.draft.bind("<Control-Return>", self._send_shortcut)
+        row = ttk.Frame(content)
+        row.pack(fill="x", pady=(6, 0))
+        self.send_button = ttk.Button(row, text="Send", command=self.ask_acumen)
+        self.send_button.pack(side="left")
+        self.retry_button = ttk.Button(row, text="Retry last", command=self.retry_question, state="disabled")
+        self.retry_button.pack(side="left", padx=6)
+        ttk.Button(row, text="Copy answers", command=self.copy_answers).pack(side="right")
 
-    def design_pet_with_ai(self):
-        if pet_ai is None:
-            return
-        if not pet_ai.load_api_key():
-            self.set_api_key()
-            if not pet_ai.load_api_key():
-                return
-        idea = simpledialog.askstring(
-            "Design a pet",
-            "Describe the pet you want.\nFor example: a sleepy purple owl that leaves a trail.\n"
-            "Leave blank and DeepSeek will surprise you.",
-            parent=self.root,
-        )
-        if idea is None:
-            return
-        self.ai_button.config(state="disabled", text="Designing…")
-        self.ai_status.config(text="Asking DeepSeek to design your pet…")
-        threading.Thread(target=self._design_worker, args=(idea,), daemon=True).start()
-
-    def _design_worker(self, idea):
-        try:
-            design = pet_ai.design_pet(idea)
-        except RuntimeError as exc:
-            self.root.after(0, self._design_failed, str(exc))
-        except Exception as exc:  # noqa: BLE001 - never let the thread die silently
-            logging.exception("Pet design failed")
-            self.root.after(0, self._design_failed, f"Unexpected error: {exc}")
-        else:
-            self.root.after(0, self._design_ready, design)
-
-    def _design_failed(self, message):
-        self.ai_button.config(state="normal", text="Design a pet with AI")
-        self.ai_status.config(text="Could not design a pet.")
-        messagebox.showerror("Desktop Pets", message, parent=self.root)
-
-    def _design_ready(self, design):
-        self.ai_button.config(state="normal", text="Design a pet with AI")
-        self.ai_status.config(text=f"Ready. Last pet: {design.get('name', 'a pet')}.")
+    def design_pet(self):
         if len(self.pets) >= MAX_PETS:
-            messagebox.showinfo("Desktop Pets",
-                                f"You already have {MAX_PETS} pets. Remove one first.",
-                                parent=self.root)
             return
+        if pet_ai is None:
+            self.play_status.config(text="pet_ai.py is missing. Restore it to create custom pets.")
+            return
+        design = pet_ai.design_pet(self.idea.get())
         self.add_pet(design)
+        self.play_status.config(text=f"Welcome, {design['name']}. {design['personality']}")
         self.save_settings()
+
+    def play(self, action):
+        if not self.pets:
+            self.play_status.config(text="Add a pet first, then choose something to play.")
+            return
+        for pet in self.pets:
+            pet.set_action(action)
+        labels = {"treat": "Treat time!", "dance": "A tiny desktop dance party.", "nap": "A moment of peace and quiet.",
+                  "zoom": "Here come the zoomies.", "follow": "Move the cursor. Your pets will follow for 15 seconds.",
+                  "wander": "Back to exploring."}
+        suffix = " Press Resume to watch." if self.paused else " Show pets to watch." if self.hidden else ""
+        self.play_status.config(text=labels.get(action, action) + suffix)
+
+    def _set_busy(self, busy):
+        self.busy = busy
+        state = "disabled" if busy else "normal"
+        for widget in (self.connect_button, self.start_button, self.send_button, self.url_entry, self.token_entry):
+            widget.config(state=state)
+        self.retry_button.config(state="normal" if self.last_question and not busy else "disabled")
+        self.send_button.config(text="Waiting…" if busy else "Send")
+
+    def _launch_request(self, kind, work, question=""):
+        if self.busy or self.closed:
+            return
+        self.request_id += 1
+        request_id = self.request_id
+        self._set_busy(True)
+
+        def worker():
+            try:
+                value = work()
+            except Exception as exc:
+                self.results.put((request_id, kind, None, str(exc), question))
+            else:
+                self.results.put((request_id, kind, value, None, question))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _configured_client(self):
+        return AcumenClient(self.acumen_url.get(), self.token.get())
+
+    def connect_acumen(self):
+        if self.busy:
+            return
+        try:
+            client = self._configured_client()
+        except RuntimeError as exc:
+            self.ai_status.config(text=str(exc))
+            return
+        self.client = None
+        self.ai_status.config(text="Checking the Acumen connection…")
+
+        def connect():
+            client.check_connection()
+            return client
+
+        self._launch_request("connect", connect)
+
+    def start_acumen(self):
+        if self.busy:
+            return
+        address = self.acumen_url.get()
+        self.ai_status.config(text="Starting your local Acumen installation…")
+        self._launch_request("start", lambda: self.bridge.start(address))
+
+    def open_acumen(self):
+        try:
+            url = normalize_base_url(self.acumen_url.get())
+        except RuntimeError as exc:
+            self.ai_status.config(text=str(exc))
+            return
+        webbrowser.open(url)
+
+    def _send_shortcut(self, _event):
+        self.ask_acumen()
+        return "break"
+
+    def ask_acumen(self, question=None):
+        if self.busy:
+            return
+        question = self.draft.get("1.0", "end-1c") if question is None else question
+        if not question.strip():
+            self.ai_status.config(text="Type a question first.")
+            self.draft.focus_set()
+            return
+        try:
+            client = self._configured_client()
+        except RuntimeError as exc:
+            self.ai_status.config(text=str(exc))
+            return
+        self.last_question = question
+        self._append_message("You", question)
+        self.ai_status.config(text="Acumen is answering. Your pets can keep playing.")
+        self._launch_request("ask", lambda: client.ask(question), question)
+
+    def retry_question(self):
+        if self.last_question:
+            self.ask_acumen(self.last_question)
+
+    def _append_message(self, speaker, text):
+        at_bottom = self.transcript.yview()[1] >= 0.98
+        self.transcript.config(state="normal")
+        self.transcript.insert("end", speaker + "\n", speaker)
+        self.transcript.insert("end", text + "\n\n")
+        self.transcript.config(state="disabled")
+        if at_bottom:
+            self.transcript.see("end")
+
+    def copy_answers(self):
+        self.root.clipboard_clear()
+        self.root.clipboard_append(self.transcript.get("1.0", "end-1c"))
+
+    def _drain_results(self):
+        while True:
+            try:
+                request_id, kind, value, error, question = self.results.get_nowait()
+            except queue.Empty:
+                return
+            if request_id != self.request_id or self.closed:
+                continue
+            self._set_busy(False)
+            if error:
+                self.ai_status.config(text=error)
+                if kind == "ask":
+                    self._append_message("Connection", error)
+                continue
+            if kind in ("start", "connect"):
+                self.client = value
+                self.acumen_url.set(value.base_url)
+                self.token.set(value.token)
+                self.ai_status.config(text="Connected to Acumen. Pairing token is kept only for this session.")
+            else:
+                self._append_message("Acumen", value["text"])
+                self.ai_status.config(text="Answer received from Acumen.")
+                # A new draft typed while waiting must never be erased.
+                if self.draft.get("1.0", "end-1c") == question:
+                    self.draft.delete("1.0", "end")
+                if self.pets:
+                    random.choice(self.pets).set_action("treat")
 
     def add_pet(self, design=None):
         if len(self.pets) >= MAX_PETS:
             return
         pet = Pet(self.root, self.bounds, self.topmost.get(), design)
+        pet.sound_enabled = self.sound.get()
         if self.hidden:
             pet.win.withdraw()
         self.pets.append(pet)
@@ -651,10 +989,10 @@ class App:
 
     def _refresh_label(self):
         n = len(self.pets)
-        self.count_label.config(
-            text=f"{n} pet{'s' if n != 1 else ''} on your desktop" +
-                 (" · hidden" if self.hidden else " · paused" if self.paused else ""))
+        self.count_label.config(text=f"{n} of {MAX_PETS} pets" +
+                                (" · hidden" if self.hidden else " · paused" if self.paused else " · exploring"))
         self.add_button.config(state="disabled" if n >= MAX_PETS else "normal")
+        self.design_button.config(state="disabled" if n >= MAX_PETS else "normal")
         self.remove_button.config(state="disabled" if not n else "normal")
 
     def toggle_pause(self):
@@ -672,17 +1010,21 @@ class App:
     def _speed_changed(self, _value=None):
         self.speed_label.config(text=f"Flight speed: {self.speed.get():.2f}×")
 
-    def _topmost_changed(self):
+    def _preferences_changed(self):
         for pet in self.pets:
             pet.win.attributes("-topmost", self.topmost.get())
+            pet.sound_enabled = self.sound.get()
+        self.save_settings()
 
     def save_settings(self):
-        data = {
-            "count": len(self.pets),
-            "speed": self.speed.get(),
-            "topmost": self.topmost.get(),
-            "pets": [pet.design for pet in self.pets if pet.design],
-        }
+        try:
+            address = normalize_base_url(self.acumen_url.get())
+        except RuntimeError:
+            address = self.settings["acumen_url"]
+        data = {"count": len(self.pets), "speed": self.speed.get(), "topmost": self.topmost.get(),
+                "pets": [pet.design for pet in self.pets], "spontaneous": self.spontaneous.get(),
+                "sound": self.sound.get(), "draft": self.draft.get("1.0", "end-1c")[:12000],
+                "idea": self.idea.get()[:12000], "acumen_url": address}
         temporary = self.config_path.with_suffix(f".{os.getpid()}.tmp")
         try:
             self.config_path.parent.mkdir(parents=True, exist_ok=True)
@@ -691,8 +1033,10 @@ class App:
         except OSError:
             logging.exception("Could not save settings")
             self.save_status.config(text="Settings could not be saved. Changes apply for this session.")
+            self.save_status.pack(side="bottom", anchor="w", pady=(6, 0), before=self.tabs)
         else:
             self.save_status.config(text="")
+            self.save_status.pack_forget()
 
     def _callback_error(self, exc_type, exc, tb):
         logging.error("App error", exc_info=(exc_type, exc, tb))
@@ -701,6 +1045,7 @@ class App:
     def _loop(self):
         if self.closed:
             return
+        self._drain_results()
         self.frame += 1
         if self.frame % 50 == 0:
             self.bounds = work_area(self.root)
@@ -709,8 +1054,9 @@ class App:
                 pet._clamp()
                 pet._place()
         if not self.paused and not self.hidden:
+            cursor = self.root.winfo_pointerxy() if any(pet.action == "follow" for pet in self.pets) else None
             for pet in self.pets:
-                pet.update(self.speed.get())
+                pet.update(self.speed.get(), cursor=cursor, spontaneous=self.spontaneous.get())
         if self.frame % 125 == 0:
             self.save_settings()
         self.timer = self.root.after(TICK_MS, self._loop)
@@ -720,12 +1066,14 @@ class App:
             return
         self.save_settings()
         self.closed = True
+        self.request_id += 1
         if self.timer is not None:
             self.root.after_cancel(self.timer)
         for pet in self.pets:
             pet.destroy()
         self.pets = []
         self.root.destroy()
+        self.bridge.close()
 
     def run(self):
         self.root.mainloop()

@@ -1,70 +1,94 @@
-DESKTOP PETS - tiny flying pets for your Windows desktop
-========================================================
+# Desktop Pets
 
-WHAT IT IS
-A little Windows program that fills your screen with tiny colorful
-pets. They flap their wings, wander around, and bounce off the edges
-of your screen. Each pet floats in its own little window above your
-other windows.
+Little animated companions for Windows 10 or 11. Requires Python 3.10 or newer
+with Tkinter. The pets app itself uses only Python's standard library.
 
-WHAT YOU NEED
-- Windows 10 or 11
-- Python 3 (free) from https://www.python.org/downloads/
-  During install, tick "Add python.exe to PATH".
+Double-click **run_pets.bat**, or run `py -3 desktop_pets.py` from this folder.
+To add Start Menu and optional desktop shortcuts, run `py -3 install_app.py`.
+Keep this folder in place after installing. Re-run the installer to update older
+shortcuts to the currently selected Python version.
 
-HOW TO RUN
-1. Unzip this folder anywhere you like.
-2. Double-click run_pets.bat
-   (or right-click desktop_pets.py -> Open with -> Python)
+## Pets & play
 
-INSTALL IT AS A REAL APP (RECOMMENDED)
-1. Double-click install_app.py (or run: py -3 install_app.py)
-2. Answer the question about a desktop shortcut.
-3. Press the Windows key and type "Desktop Pets" - it is now in your
-   Start Menu with its own bird icon, and it launches with no black
-   console window.
+- **Surprise pet** adds a random bird, fish, cat, blob, bug, or ghost (up to 12).
+  Pets have different palettes, names, personalities, sizes and accessories.
+- **Make a pet** recognizes descriptions such as `a sleepy purple cat with a crown`,
+  `a tiny golden koi with sparkles`, or `a fast blue ghost with glasses and a trail`.
+  It uses local keyword rules; it is instant and needs no API key. Unknown details
+  don't add new shapes. Blank descriptions create a surprise.
+- Give everyone treats, start a dance party, take a nap, trigger zoomies, or follow
+  the cursor for 15 seconds. **Wander** ends an activity. Right-click a pet to play
+  with that pet alone. Click to boop; drag to reposition.
+- Pets blink and occasionally do something on their own. Turn off **Little surprises**
+  to keep them wandering. Sounds start off and can be enabled separately.
+- Pause, hide, change flight speed, or change whether pets stay above other windows.
+  Pause and hide also stop activity timers. Minimize the panel to keep pets flying;
+  closing it quits.
 
-To remove the shortcuts later, use "Uninstall Desktop Pets" in the
-Start Menu (or run uninstall_app.py). Your settings are kept.
+## AcumenAI
 
-WHAT IT DOES
-- 3 little pets start flying around your screen right away.
-- The "Desktop Pets" control panel lets you add more (up to 12)
-  or remove pets.
-- Click a pet to boop it - it zooms off in a new direction, happily.
-- Close the control panel (or press "Close all") to say goodbye.
+The **Ask Acumen** tab uses the existing AcumenAI local bridge for actual questions,
+math, and research. Questions and Acumen commands are sent unchanged; source text
+is preserved in answers. Pet creation uses local rules because Acumen's bridge
+is a question-answering service, not a pet-design model. DeepSeek is no longer required.
 
-DESIGN YOUR OWN PETS WITH DEEPSEEK
-The panel has a "Design a pet with AI" button. DeepSeek invents a pet -
-its shape, colours, size, speed, flapping, whether it leaves a trail or
-sparkles - and it appears on your desktop straight away. Your custom
-pets are remembered the next time you start the app.
+### One-click start
 
-Pets come in six shapes: bird, fish, cat, blob, bug and ghost. Ask for
-"a sleepy purple owl" and you get a bird; ask for "a golden koi" and you
-get a fish. DeepSeek picks the closest shape to what you describe.
+1. Keep your working `AcumenAI-2.0` installation beside this folder, or set
+   `ACUMEN_HOME` to its folder. Its dependencies and `config.yaml` must already work.
+2. Open **Ask Acumen** and click **Start Acumen**.
+3. Wait for **Connected to Acumen**, then type a question and click **Send**
+   (or press Ctrl+Enter). Try `Calculate 6*7`.
 
-One-time setup:
-1. Get a free API key at https://platform.deepseek.com/api_keys
-2. In the app, click "API key..." and paste it in.
-   (It is saved to %LOCALAPPDATA%\Desktop Pets\api_key.txt)
+The app uses Acumen's `.worker-venv`, `.venv`, or `venv` when available, then the
+app's Python as a fallback. It starts the bridge hidden on `127.0.0.1`, pairs
+automatically, and stops only the bridge it started when you quit Desktop Pets.
+That bridge uses Acumen's configured knowledge directory. Acumen may access the
+internet to answer research questions, according to its own configuration.
 
-You can also set the DEEPSEEK_API_KEY environment variable instead.
-Then click "Design a pet with AI" and describe what you want, for
-example "a sleepy purple owl that leaves a trail". Leave the box blank
-and DeepSeek will surprise you.
+### Connect to a running bridge
 
-The pets stay on top of your other windows, but only the pet itself
-takes up space - the rest of your screen works normally.
+1. Start your Acumen bridge as usual. For this checkout, from `AcumenAI-2.0`:
+   `.\.worker-venv\Scripts\python.exe bridge.py`
+2. In **Ask Acumen**, enter its local address (default `http://127.0.0.1:8765`).
+3. Paste the pairing token shown by Acumen and click **Connect**.
 
-FILES
-- desktop_pets.py  the app itself
-- pet_ai.py        the DeepSeek pet designer
-- launch_pets.pyw  silent launcher used by the shortcuts
-- install_app.py   adds Start Menu / desktop shortcuts
-- uninstall_app.py removes those shortcuts
-- make_icon.py     regenerates pets.ico (the app icon)
-- run_pets.bat     quick launch without installing
+You can also set `ACUMEN_BRIDGE_URL` and `ACUMEN_TOKEN` before launching.
+The token stays in memory; Desktop Pets never writes it into its settings or logs.
+An externally started Acumen bridge keeps running when you close the pets app.
+**Open Acumen** opens the local website for its full learning and knowledge controls.
+Use Acumen's own controls to review/save learning before stopping its bridge.
 
-Have fun!
-- Fawkes
+Requests run in the background so pets and controls remain responsive. Failed
+questions remain available through **Retry last**, and typing a new draft while
+waiting never gets overwritten by the previous answer. You can select/copy answers
+or use **Copy answers** to copy the conversation.
+
+## Saved settings and troubleshooting
+
+Pets, play preferences, bridge address and unfinished drafts are saved in
+`%LOCALAPPDATA%\Desktop Pets\settings.json`. Existing pet designs are retained.
+Conversations are kept only for the current pets-app session; Acumen manages its
+own session data. Errors are logged to `%LOCALAPPDATA%\Desktop Pets\app.log`.
+
+- **A server already uses this port:** paste that Acumen server's token and Connect,
+  or choose a different local port before Start Acumen.
+- **Pairing token not accepted:** restarting Acumen may change its token. Paste the
+  current token and reconnect. Tokens are not recovered from another app's files.
+- **Could not find/start Acumen:** check `ACUMEN_HOME`, its Python environment and
+  config. Run its `bridge.py` manually to see its startup error, then Connect.
+- **Long or failed answer:** check the Acumen server, then Retry last. Pets still work
+  without Acumen running.
+- **Wrong Python opens:** install a current Python with the Windows Python launcher,
+  then use `run_pets.bat` or `py -3 desktop_pets.py`. Reinstall shortcuts if needed.
+
+## Validation
+
+Run `py -3 -m unittest discover -s tests -v`. GUI tests create real Tk widgets and
+temporary settings; they don't overwrite your saved pets. The optional real Acumen
+smoke test is `py -3 scripts/check_acumen.py`; it uses isolated temporary knowledge
+storage and an unused local port, then shuts down its owned server.
+
+Main files: `desktop_pets.py` (UI and animation), `pet_ai.py` (local pet designs),
+`acumen_client.py` (authenticated local API), `acumen_bridge.py` (owned bridge
+startup), and `launch_pets.pyw` / `run_pets.bat` (launchers).

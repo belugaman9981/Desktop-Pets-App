@@ -10,6 +10,13 @@ import os
 import sys
 from pathlib import Path
 
+if sys.version_info < (3, 10):
+    import ctypes
+    ctypes.windll.user32.MessageBoxW(None,
+        "Desktop Pets needs Python 3.10 or newer. Install a current Python with the Python launcher, then use run_pets.bat.",
+        "Desktop Pets", 16)
+    sys.exit(1)
+
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 
